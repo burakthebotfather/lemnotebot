@@ -1,135 +1,296 @@
 import os
+import re
 import asyncio
 import logging
+import sqlite3
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
 from aiogram.types import Message
-from aiogram.filters import Filter
+from aiogram.enums import ParseMode
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from db import Database
-from parser_utils import parse_trigger_and_amount, CHAT_MAP
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ------------------------------------------------------
+#                      CONFIG
+# ------------------------------------------------------
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-if not TELEGRAM_TOKEN:
-    raise RuntimeError('TELEGRAM_TOKEN env var required')
-ADMIN_ID = int(os.getenv('ADMIN_ID', '542345855'))
-TIMEZONE = os.getenv('TZ', 'Europe/Vienna')
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_ID = 542345855  # ID администратора для отчётов
 
-bot = Bot(token=TELEGRAM_TOKEN)
+bot = Bot(TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
-db = Database(os.path.join(os.path.dirname(__file__), '..', 'notepad_bot.sqlite'))
 
-class AllowedThreadFilter(Filter):
-    async def __call__(self, message: Message) -> bool:
-        chat_id = message.chat.id
-        thread_id = getattr(message, 'message_thread_id', None)
-        if chat_id in CHAT_MAP:
-            _, expected_thread = CHAT_MAP[chat_id]
-            return expected_thread == thread_id
-        return False
+DB = "database.sqlite"
 
-@dp.message()
-async def handle_message(message: Message):
-    # only process messages from allowed chats/threads
+
+# ------------------------------------------------------
+#                    TRIGGER VALUES
+# ------------------------------------------------------
+
+TRIGGERS = {
+    "+": 2.56,
+    "+ мк": 2.39,
+    "+ мк синяя": 4.05,
+    "+ мк красная": 5.71,
+    "+ мк оранжевая": 6.37,
+    "+ мк салатовая": 8.03,
+    "+ мк коричневая": 8.69,
+    "+ мк светло-серая": 10.35,
+    "+ мк розовая": 11.01,
+    "+ мк темно-серая": 12.67,
+    "+ мк голубая": 13.33,
+}
+
+GAB_VALUE = 2.89
+
+
+# ------------------------------------------------------
+#                     CHAT MAP
+# ------------------------------------------------------
+
+CHAT_MAP = {
+    -1002079167705: ("A. Mousse Art Bakery - Белинского, 23", 48),
+    -1002936236597: ("B. Millionroz.by - Тимирязева, 67", 3),
+    -1002423500927: ("E. Flovi.Studio - Тимирязева, 65Б", 2),
+    -1003117964688: ("F. Flowers Titan - Мележа, 1", 5),
+    -1002864795738: ("G. Цветы Мира - Академическая, 6", 3),
+    -1002535060344: ("H. Kudesnica.by - Старовиленский тракт, 10", 5),
+    -1002477650634: ("I. Cvetok.by - Восточная, 41", 3),
+    -1003204457764: ("J. Jungle.by - Неманская, 2", 4),
+    -1002660511483: ("K. Pastel Flowers - Сурганова, 31", 3),
+    -1002360529455: ("333. ТЕСТ БОТОВ - 1-й Нагатинский пр-д", 0),
+    -1002538985387: ("L. Lamour.by - Кропоткина, 84", 3),
+}
+
+
+# ------------------------------------------------------
+#                     DB INIT
+# ------------------------------------------------------
+
+def init_db():
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            message_id INTEGER,
+            thread_id INTEGER,
+            text TEXT,
+            created_ts INTEGER,
+            to_process_ts INTEGER,
+            processed INTEGER DEFAULT 0
+        )
+        """
+    )
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS earnings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            total REAL
+        )
+        """
+    )
+
+    # Ensure single counter row
+    c.execute("INSERT OR IGNORE INTO earnings (id, total) VALUES (1, 0)")
+
+    conn.commit()
+    conn.close()
+
+
+# ------------------------------------------------------
+#               TRIGGER PARSER
+# ------------------------------------------------------
+
+def parse_trigger(text: str) -> float | None:
+    t = text.lower().strip()
+
+    # GAB
+    if "габ" in t:
+        match = re.search(r"(\d*)\s*габ", t)
+        if match:
+            num = match.group(1)
+            return int(num) * GAB_VALUE if num.isdigit() else GAB_VALUE
+
+    # "+" triggers
+    for trig, val in sorted(TRIGGERS.items(), key=lambda x: -len(x[0])):
+        if t.startswith(trig):
+            return val
+
+    return None
+
+
+# ------------------------------------------------------
+#                STORE INCOMING MESSAGE
+# ------------------------------------------------------
+
+async def store_message(message: Message):
     chat_id = message.chat.id
-    thread_id = getattr(message, 'message_thread_id', None)
+    thread_id = message.message_thread_id
+
+    # Filter: chat not registered
     if chat_id not in CHAT_MAP:
         return
-    expected_title, expected_thread = CHAT_MAP[chat_id]
-    if expected_thread != thread_id:
+
+    # Filter: wrong thread
+    if thread_id != CHAT_MAP[chat_id][1]:
         return
-    text = (message.text or "").strip()
+
+    text = message.text or ""
     if "+" not in text:
-        return  # ignore messages without '+'
-    # Save for delayed processing (5 minutes)
-    now = datetime.utcnow()
-    process_after = now + timedelta(minutes=5)
-    await db.save_pending_message(
-        message_id=message.message_id,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        user_id=message.from_user.id if message.from_user else None,
-        text=text,
-        timestamp_original=now,
-        process_after=process_after
-    )
-    logger.info("Saved pending message %s from chat %s", message.message_id, chat_id)
-
-async def process_due_messages():
-    due = await db.get_due_messages()
-    if not due:
         return
-    for row in due:
-        try:
-            text = row['text']
-            chat_id = row['chat_id']
-            timestamp_original = row['timestamp_original']
-            chat_title = CHAT_MAP.get(chat_id, ('Unknown', None))[0]
-            amount, trigger_text = parse_trigger_and_amount(text)
-            if amount is None:
-                # mark processed and continue
-                await db.mark_processed(row['id'])
-                logger.info('No valid trigger found in message id %s', row['id'])
-                continue
-            # Update counter and log
-            await db.add_to_counter(amount)
-            await db.insert_log(amount, trigger_text, chat_title, chat_id, datetime.utcnow())
-            S = await db.get_counter()
-            # format times to timezone
-            try:
-                tz = ZoneInfo(TIMEZONE)
-                local_dt = timestamp_original.replace(tzinfo=ZoneInfo('UTC')).astimezone(tz)
-                time_str = local_dt.strftime('%H:%M, %d.%m.%Y')
-            except Exception:
-                time_str = timestamp_original.strftime('%H:%M, %d.%m.%Y')
-            msg_text = f"{format_money(amount)} BYN\nS = {format_money(S)} BYN\n\n{chat_title}\n{time_str}"
-            # send to admin
-            await bot.send_message(ADMIN_ID, msg_text)
-            logger.info('Sent admin message for pending id %s: %s', row['id'], msg_text.replace('\n',' | '))
-        except Exception as e:
-            logger.exception('Error processing pending message id %s: %s', row.get('id'), e)
-        finally:
-            await db.mark_processed(row['id'])
 
-def format_money(x: float) -> str:
-    # format with comma decimal separator
-    return f"{x:0.2f}".replace('.', ',')
+    now = int(datetime.utcnow().timestamp())
+    process_ts = now + 300  # process after 5 minutes
+
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+
+    c.execute(
+        """
+        INSERT INTO queue (chat_id, message_id, thread_id, text, created_ts, to_process_ts)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (chat_id, message.message_id, thread_id, text, now, process_ts)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ------------------------------------------------------
+#                PROCESS QUEUE
+# ------------------------------------------------------
+
+async def process_queue():
+    now = int(datetime.utcnow().timestamp())
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+
+    c.execute(
+        """
+        SELECT id, chat_id, message_id, thread_id, text, created_ts
+        FROM queue
+        WHERE processed = 0 AND to_process_ts <= ?
+        """,
+        (now,)
+    )
+
+    rows = c.fetchall()
+
+    for row in rows:
+        q_id, chat_id, msg_id, thread_id, text, ts = row
+
+        # Extract part after "+"
+        try:
+            part = text[text.index("+"):].strip()
+        except ValueError:
+            c.execute("UPDATE queue SET processed = 1 WHERE id = ?", (q_id,))
+            conn.commit()
+            continue
+
+        amount = parse_trigger(part)
+        if amount is None:
+            c.execute("UPDATE queue SET processed = 1 WHERE id = ?", (q_id,))
+            conn.commit()
+            continue
+
+        # Load current total
+        c.execute("SELECT total FROM earnings WHERE id = 1")
+        total = c.fetchone()[0]
+
+        new_total = round(total + amount, 2)
+
+        c.execute("UPDATE earnings SET total = ? WHERE id = 1", (new_total,))
+
+        # Formatting the outgoing message
+        org_name = CHAT_MAP[chat_id][0]
+        dt = datetime.fromtimestamp(ts)
+        date_str = dt.strftime("%H:%M, %d.%m.%Y")
+
+        msg = (
+            f"+{amount:.2f} BYN\n"
+            f"S = {new_total:.2f} BYN\n\n"
+            f"{org_name}\n"
+            f"{date_str}"
+        )
+
+        # Try sending the result
+        try:
+            await bot.send_message(ADMIN_ID, msg)
+        except Exception as e:
+            print("Error sending:", e)
+
+        # Mark row as processed
+        c.execute("UPDATE queue SET processed = 1 WHERE id = ?", (q_id,))
+        conn.commit()
+
+    conn.close()
+
+
+# ------------------------------------------------------
+#                DAILY REPORT
+# ------------------------------------------------------
 
 async def daily_report():
-    try:
-        S = await db.get_counter()
-        tz = ZoneInfo(TIMEZONE)
-        today = datetime.now(tz).strftime('%d.%m.%Y')
-        text = f"{format_money(S)} BYN • {today}"
-        await bot.send_message(ADMIN_ID, text)
-        logger.info('Sent daily report: %s', text)
-        await db.reset_counter()
-    except Exception as e:
-        logger.exception('Failed to send daily report: %s', e)
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
 
-async def scheduler_startup():
-    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-    scheduler.add_job(lambda: asyncio.create_task(process_due_messages()), 'interval', seconds=30)
-    scheduler.add_job(lambda: asyncio.create_task(daily_report()), CronTrigger(hour=22, minute=5, timezone=TIMEZONE))
-    scheduler.start()
-    logger.info('Scheduler started')
+    c.execute("SELECT total FROM earnings WHERE id = 1")
+    total = c.fetchone()[0]
+
+    date_str = datetime.now().strftime("%d.%m.%Y")
+
+    await bot.send_message(ADMIN_ID, f"{total:.2f} BYN • {date_str}")
+
+    # Reset counter
+    c.execute("UPDATE earnings SET total = 0 WHERE id = 1")
+    conn.commit()
+    conn.close()
+
+
+# ------------------------------------------------------
+#                HANDLERS
+# ------------------------------------------------------
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    await message.answer("Bot is running!")
+
+
+@dp.message(F.text)
+async def on_message(message: Message):
+    await store_message(message)
+
+
+# ------------------------------------------------------
+#                MAIN APP
+# ------------------------------------------------------
 
 async def main():
-    await db.init_db()
-    await scheduler_startup()
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    init_db()
 
-if __name__ == '__main__':
-    import uvloop
-    uvloop.install()
+    scheduler = AsyncIOScheduler(timezone="Europe/Vienna")
+
+    # Check queue every 20 sec
+    scheduler.add_job(process_queue, "interval", seconds=20)
+
+    # Daily report @ 22:05
+    scheduler.add_job(daily_report, CronTrigger(hour=22, minute=5))
+
+    scheduler.start()
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
